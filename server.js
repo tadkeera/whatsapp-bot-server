@@ -40,7 +40,7 @@ client.on('qr', (qr) => {
     console.log('QR Code updated. Ready to scan.');
 });
 
-// نجاح الاتصال بالواتساب
+// نجاح الاتصال بالواتساب وتحديث الحالة في سوبابيز مع الـ provider الصحيح
 client.on('ready', async () => {
     isReady = true;
     qrCodeData = '';
@@ -50,6 +50,7 @@ client.on('ready', async () => {
         await supabase.from('whatsapp_settings').upsert({ 
             server_id: SPACE_SERVER_ID, 
             status: 'connected', 
+            provider: 'huggingface', // القيمة الجديدة المتوافقة مع الـ Constraint المحدثة
             updated_at: new Date() 
         });
     } catch (err) {
@@ -57,7 +58,7 @@ client.on('ready', async () => {
     }
 });
 
-// معالجة الرسائل الواردة (البوت الذكي)
+// معالجة الرسائل الواردة (البوت الذكي للمستشفى)
 client.on('message', async (msg) => {
     const from = msg.from;
     const body = msg.body;
@@ -127,7 +128,7 @@ app.get('/api/qr', (req, res) => {
     `);
 });
 
-// مسار استقبال طلبات الإرسال من سيرفر Vercel
+// مسار استقبال طلبات الإرسال من سيرفر Vercel لإرسال التنبيهات والمواعيد تلقائياً
 app.post('/api/send-message', async (req, res) => {
     const { to, message } = req.body;
     if (!isReady) {

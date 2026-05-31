@@ -1,104 +1,621 @@
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
-const { 
-  makeWASocket, 
-  useMultiFileAuthState, 
-  DisconnectReason, 
-  BufferJSON, 
-  useBufferSize,
-  fetchLatestBaileysVersion,
-  delay
-} = require('@whiskeysockets/baileys');
-const QRCode = require('qrcode');
-const pino = require('pino');
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const AdmZip = require('adm-zip');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-const RENDER_SERVER_ID = process.env.RENDER_SERVER_ID || 'default-bot-server';
+const PORT = process.env.PORT || 7860;
+const SPACE_SERVER_ID = process.env.SPACE_SERVER_ID || 'default_space_server';
 
-// إعداد عميل Supabase للمصادقة وتعديل البيانات
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+// Initialize Supabase Connection
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!supabaseUrl || !supabaseKey) {
-  console.error('[CRITICAL] Supabase URL or Key configuration is missing in Environment Variables!');
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('[Error] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY are missing from environment!');
   process.exit(1);
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false }
+});
 
-let sock = null;
-let currentQr = null;
-let connectionStatus = 'Disconnected';
+// App connection statuses
+let globalQrText = null;
+let connectionStatus = 'DISCONNECTED'; // DISCONNECTED, CONNECTING, AWAITING_SCAN, CONNECTED
+let lastBackupAt = null;
 
-// -------------------------------------------------------------------------
-// دوال التوقيت المخصصة بتوقيت اليمن/مكة (UTC+3)
-// -------------------------------------------------------------------------
-function getYemenTime() {
-  const localDate = new Date();
-  const utc = localDate.getTime() + localDate.getTimezoneOffset() * 60050;
-  // التوقيت اليمني (+3 ساعات)
-  return new Date(utc + 3 * 3600 * 1000);
+// =========================================================================
+// ZIP BACKUP AND RESTORE UTILITIES (Bypasses ephemeral container restarts)
+// =========================================================================
+
+async function restoreAuthSession() {
+  try {
+    console.log('[Auth Persistence] Restoring latest backup from Supabase...');
+    const { data, error } = await supabase
+      .from('whatsapp_sessions')
+      .select('session_data')
+      .eq('space_server_id', SPACE_SERVER_ID)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[Auth Restore Error]', error.message);
+      return;
+    }
+
+    if (data && data.session_data) {
+      const authDir = path.join(__dirname, '.wwebjs_auth');
+      if (fs.existsSync(authDir)) {
+        fs.rmSync(authDir, { recursive: true, force: true });
+      }
+
+      const zipBuffer = Buffer.from(data.session_data, 'base64');
+      const zip = new AdmZip(zipBuffer);
+      zip.extractAllTo(authDir, true);
+      console.log('[Auth Persistence] Saved state recovered successfully from Supabase!');
+    } else {
+      console.log('[Auth Persistence] No saved state found. Starting fresh QR session...');
+    }
+  } catch (err) {
+    console.error('[Auth Restore General Exception]', err.message);
+  }
+}
+
+async function backupAuthSession() {
+  try {
+    const authDir = path.join(__dirname, '.wwebjs_auth');
+    if (!fs.existsSync(authDir)) {
+       console.log('[Auth Persistence] No authentication files found locally to backup.');
+       return;
+    }
+
+    console.log('[Auth Persistence] Generating backup bundle zip...');
+    const zip = new AdmZip();
+    zip.addLocalFolder(authDir);
+    const zipBase64 = zip.toBuffer().toString('base64');
+
+    const { error } = await supabase
+      .from('whatsapp_sessions')
+      .upsert({
+        space_server_id: SPACE_SERVER_ID,
+        session_data: zipBase64,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'space_server_id' });
+
+    if (error) {
+      console.error('[Auth Backup Error] Failed to update Supabase row:', error.message);
+    } else {
+      lastBackupAt = new Date().toISOString();
+      console.log('[Auth Persistence] Session successfully backed up to Supabase database!');
+    }
+  } catch (err) {
+    console.error('[Auth Backup Exception]', err.message);
+  }
+}
+
+// =========================================================================
+// WHATSAPP CLIENT INITIALIZATION
+// =========================================================================
+
+async function startWhatsAppBot() {
+  // First recover existing token sessions
+  await restoreAuthSession();
+
+  console.log('[WhatsApp Launcher] Initializing browser engine...');
+  const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process'
+      ],
+      headless: true
+    }
+  });
+
+  client.on('qr', (qr) => {
+    globalQrText = qr;
+    connectionStatus = 'AWAITING_SCAN';
+    console.log('[WhatsApp QR] New QR text generated! Please view it via /api/qr');
+  });
+
+  client.on('authenticated', () => {
+    console.log('[WhatsApp Event] Authentication complete! Client initialized.');
+    connectionStatus = 'CONNECTED';
+    globalQrText = null;
+  });
+
+  client.on('ready', () => {
+    console.log('[WhatsApp Event] Client is fully ready and online!');
+    connectionStatus = 'CONNECTED';
+    // Sync authenticated session storage back to the cloud
+    setTimeout(backupAuthSession, 12000);
+  });
+
+  client.on('disconnected', async (reason) => {
+    console.warn('[WhatsApp Event] Connection lost!', reason);
+    connectionStatus = 'DISCONNECTED';
+    globalQrText = null;
+  });
+
+  // Handle inbound text state machine
+  client.on('message', async (messageMsg) => {
+    try {
+      const fromPhone = messageMsg.from.split('@')[0];
+      const messageText = (messageMsg.body || '').trim();
+
+      // Skip groups and statuses
+      if (messageMsg.from.endsWith('@g.us') || messageMsg.from === 'status@broadcast') {
+        return;
+      }
+
+      console.log(`[Chatbot Inbound] [+${fromPhone}]: "${messageText}"`);
+
+      // Mimics the real exact SQL flow in server.ts
+      const botResponse = await handleWhatsappFlow(fromPhone, messageText);
+
+      if (botResponse) {
+        await client.sendMessage(messageMsg.from, botResponse);
+        console.log(`[Chatbot Outbound] Replied directly to [+${fromPhone}] via client.`);
+      }
+    } catch (err) {
+      console.error('[Chatbot Webhook Exception]', err.message);
+    }
+  });
+
+  client.initialize();
+
+  // =========================================================================
+  // HTTP REST GATEWAYS
+  // =========================================================================
+
+  // Outbound push notification sender API
+  app.post('/api/send-message', async (req, res) => {
+    const { to, message } = req.body;
+    if (!to || !message) {
+      return res.status(400).json({ error: 'Missing standard parameters (to, message)' });
+    }
+
+    if (connectionStatus !== 'CONNECTED') {
+      return res.status(503).json({ error: 'WhatsApp Gateway Client is currently disconnected' });
+    }
+
+    const cleanFormattedPhone = to.replace(/^\+/, '').replace(/\s+/g, '') + '@c.us';
+
+    try {
+      console.log(`[Outbound Gateway] Delivering text to ${cleanFormattedPhone}`);
+      const chat = await client.sendMessage(cleanFormattedPhone, message);
+      res.json({ success: true, messageId: chat.id._serialized });
+    } catch (err) {
+      console.error('[Outbound Message Exception]', err.message);
+      res.status(500).json({ error: 'Failed to deliver message', details: err.message });
+    }
+  });
+
+  // Status check & QR Render Webpage
+  app.get('/api/qr', (req, res) => {
+    let content = '';
+
+    if (connectionStatus === 'CONNECTED') {
+      content = `
+        <div style="text-align: center; font-family: sans-serif; padding-top: 50px;">
+          <div style="font-size: 80px;">✅</div>
+          <h2 style="color: #2e7d32; font-weight: 800; margin-top: 20px;">تم الاتصال بنجاح!</h2>
+          <p style="color: #555;">الموقع متصل بالطرف المساعد للبوت وجاهز لإرسال واستقبال الرسائل.</p>
+          <div style="background: #f1f8e9; display: inline-block; padding: 12px 25px; border-radius: 20px; font-weight: bold; color: #33691e; margin-top: 15px;">
+             Active Client: ${SPACE_SERVER_ID}
+          </div>
+          <p style="margin-top: 30px; color: #999; font-size: 11px;">آخر مزامنة لقاعدة البيانات: ${lastBackupAt || 'نشط حالياً'}</p>
+        </div>
+      `;
+    } else if (connectionStatus === 'AWAITING_SCAN' && globalQrText) {
+      const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(globalQrText)}&size=300x300`;
+      content = `
+        <div style="text-align: center; font-family: sans-serif; padding: 40px 15px;">
+          <h2 style="color: #1a237e; font-weight: 800; margin-bottom: 5px;">ربط واتساب مستشفى برج الأطباء</h2>
+          <p style="color: #666; font-size: 14px; margin-bottom: 25px;">يرجى مسح الرمز المربع (QR) الموضح أدناه من تطبيق واتساب بهاتفك للربط مباشرة:</p>
+          <div style="background: #ffffff; padding: 25px; display: inline-block; border-radius: 16px; border: 1px solid #e0e0e0; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
+             <img src="${qrImageUrl}" alt="WhatsApp Scan" style="display: block;" />
+          </div>
+          <div style="margin-top: 25px; font-weight: bold; color: #d32f2f;">
+             ⚠️ حالة الاتصال: بانتظار مسح الباركود مفعلاً بالهاتف
+          </div>
+          <p style="margin-top:20px; color: #888; font-size: 12px;">تأكد من عدم اغلاق هذه الصفحة حتى تمام الاتصال لضمان حفظ الجلسة وقفل الأمان.</p>
+        </div>
+      `;
+    } else {
+      content = `
+        <div style="text-align: center; font-family: sans-serif; padding-top: 60px;">
+          <div style="font-size: 80px;">⏳</div>
+          <h2 style="color: #e65100; font-weight: 800; margin-top: 20px;">جارٍ تهيئة خادم الواتساب...</h2>
+          <p style="color: #666;">يرجى الانتظار 30 ثانية لتحديث الصفحة تلقائياً مع تحميل متصفح Puppeteer.</p>
+          <p style="color: #999; font-size: 12px;">الحالة الحالية: ${connectionStatus}</p>
+          <script>setTimeout(() => { window.location.reload(); }, 6000);</script>
+        </div>
+      `;
+    }
+
+    res.send(`
+      <!DOCTYPE html>
+      <html dir="rtl" lang="ar">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>بوابة واتساب مستشفى برج الأطباء</title>
+      </head>
+      <body style="background-color: #fafafa; margin: 0; padding: 0;">
+         ${content}
+      </body>
+      </html>
+    `);
+  });
+}
+
+// =========================================================================
+// INTEGRATED AUTOMATED CHATBOT LOGIC (Ar)
+// =========================================================================
+
+function normalizePhone(phone) {
+  if (!phone) return '';
+  return phone.replace(/^\+/, '').replace(/\s+/g, '').replace(/@c\.us$/, '').trim();
 }
 
 function getDayNameArabic(dayIndex) {
-  const days = ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت'];
+  const days = ['السبت', 'الأحد', 'الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
   return days[dayIndex] || '';
 }
 
 function getCircledNumber(num) {
-  const circled = ['⓪', '❶', '❷', '❸', '❹', '❺', '❻', '❼', '❽', '❾', '❿', '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱', '⑲', '⑳'];
-  return circled[num] || `[${num}]`;
+  const circled = ['⓪', '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱', '⑲', '⑳'];
+  return num <= 20 ? circled[num] : `[ ${num} ]`;
 }
 
-function normalizePhone(phone) {
-  if (!phone) return '';
-  return phone.replace(/^\+/, '').replace(/\s+/g, '').trim();
+function getYemenTime() {
+  const utcNow = new Date().getTime();
+  const yemenOffset = 3 * 60 * 60 * 1000; // UTC+3
+  return new Date(utcNow + yemenOffset);
 }
 
-// -------------------------------------------------------------------------
-// إدارة واستعادة الجلسة بأمان من قاعدة البيانات Supabase
-// -------------------------------------------------------------------------
-async function loadSessionFromDatabase() {
-  console.log(`[Session Manager] Checking Supabase for active session id: [${RENDER_SERVER_ID}]`);
-  const { data, error } = await supabase
-    .from('whatsapp_sessions')
-    .select('session_data')
-    .eq('render_server_id', RENDER_SERVER_ID)
+function getNextWeekDate(targetDayOfWeekIndex) {
+  const now = getYemenTime();
+  const currentDay = now.getUTCDay(); // Sun is 0, Sat is 6
+  let normalizedCurrentDay = currentDay === 6 ? 0 : currentDay + 1; // Align: Sat=0, Sun=1...
+
+  let diff = targetDayOfWeekIndex - normalizedCurrentDay;
+  if (diff <= 0) {
+    diff += 7;
+  }
+  const targetDate = new Date(now.getTime() + diff * 24 * 60 * 60 * 1000);
+  return targetDate.toISOString().split('T')[0];
+}
+
+async function handleWhatsappFlow(phone, incomingMessage) {
+  const cleanPhone = normalizePhone(phone);
+  const currentYemenNow = getYemenTime();
+
+  // 1. Log inbound message
+  await supabase.from('whatsapp_logs').insert([{
+    phone: cleanPhone,
+    direction: 'in',
+    message: incomingMessage,
+    timestamp: currentYemenNow.toISOString()
+  }]);
+
+  // 2. Fetch or create interactive state
+  const { data: dbSession } = await supabase
+    .from('bot_sessions')
+    .select('*')
+    .eq('phone', cleanPhone)
     .maybeSingle();
 
-  if (error) {
-    console.error('[Session Manager] Fetch from database failed:', error.message);
-    return null;
+  let session = dbSession;
+  const isNewSession = !session;
+
+  if (isNewSession) {
+    session = {
+      phone: cleanPhone,
+      current_state: 'IDLE',
+      patient_name: null,
+      selected_doctor_id: null,
+      selected_schedule_id: null,
+      selected_day_offset: null,
+      selected_shift: null,
+      selected_date: null,
+      last_interaction_at: currentYemenNow.toISOString()
+    };
   }
-  return data ? data.session_data : null;
+
+  const outputReply = async (replyText, nextState) => {
+    // Record out log
+    await supabase.from('whatsapp_logs').insert([{
+      phone: cleanPhone,
+      direction: 'out',
+      message: replyText,
+      timestamp: getYemenTime().toISOString()
+    }]);
+
+    // Save state back to bot_sessions
+    const nextSession = {
+      phone: cleanPhone,
+      current_state: nextState,
+      patient_name: session.patient_name || null,
+      selected_doctor_id: session.selected_doctor_id || null,
+      selected_schedule_id: session.selected_schedule_id || null,
+      selected_day_offset: session.selected_day_offset || null,
+      selected_shift: session.selected_shift || null,
+      selected_date: session.selected_date || null,
+      last_interaction_at: getYemenTime().toISOString()
+    };
+
+    if (isNewSession) {
+      await supabase.from('bot_sessions').insert([nextSession]);
+    } else {
+      await supabase.from('bot_sessions').update(nextSession).eq('phone', cleanPhone);
+    }
+
+    return replyText;
+  };
+
+  const isTriggerMsg = incomingMessage.toLowerCase() === 'تسجيل';
+  const state = session.current_state;
+
+  // State Machine Core
+  if (state === 'IDLE') {
+    if (!isTriggerMsg) {
+       return outputReply("مرحباً بك في مستشفى برج الأطباء.\nللبدء في تسجيل موعد جديد آلياً، يرجى إرسال كلمة *تسجيل*", 'IDLE');
+    }
+
+    // Get active Doctors
+    const { data: doctors } = await supabase
+      .from('doctors')
+      .select('*')
+      .eq('is_active', true);
+
+    if (!doctors || doctors.length === 0) {
+      return outputReply('عذراً، لا تتوفر أي عيادات أو أطباء متاحين للتسجيل حالياً. يرجى مراجعة إدارة المشفى لاحقاً.', 'IDLE');
+    }
+
+    let prompt = `مرحباً بك في نظام حجز مستشفى برج الأطباء 🏥.\nالرجاء كتابة الرقم المقابل لاسم الطبيب المطلوب للحجز لديه:`;
+    doctors.forEach((doc, idx) => {
+      prompt += `\n\n*${idx + 1}* - د. ${doc.name} (${doc.specialty})`;
+    });
+
+    return outputReply(prompt, 'SELECTING_DOCTOR');
+  }
+
+  if (state === 'SELECTING_DOCTOR') {
+    if (isTriggerMsg) {
+      // Restart flow
+      session.current_state = 'IDLE';
+      return handleWhatsappFlow(cleanPhone, 'تسجيل');
+    }
+
+    const docSelectIndex = parseInt(incomingMessage) - 1;
+
+    const { data: doctors } = await supabase
+      .from('doctors')
+      .select('*')
+      .eq('is_active', true);
+
+    if (isNaN(docSelectIndex) || docSelectIndex < 0 || !doctors || docSelectIndex >= doctors.length) {
+      return outputReply('❌ عذراً، رقم الاختيار غير صحيح. يرجى إدخال الرقم المقابل لاسم الطبيب من القائمة السابقة.', 'SELECTING_DOCTOR');
+    }
+
+    const selectedDoc = doctors[docSelectIndex];
+    session.selected_doctor_id = selectedDoc.id;
+
+    // Fetch schedules
+    const { data: schedules } = await supabase
+      .from('schedules')
+      .select('*')
+      .eq('doctor_id', selectedDoc.id);
+
+    if (!schedules || schedules.length === 0) {
+      return outputReply(`التبويب عذراً، عيادة د. ${selectedDoc.name} غير متاح بها أيام حجز هذا الأسبوع. يرجى اختيار طبيب آخر.`, 'IDLE');
+    }
+
+    // Generate dynamic scheduling options
+    const rawOptions = [];
+    schedules.forEach(s => {
+      const dateThisWeek = getNextWeekDate(s.day_of_week);
+      rawOptions.push({
+        day_of_week: s.day_of_week,
+        date: dateThisWeek,
+        weekLabel: 'الأسبوع الحالي',
+        schedule: s
+      });
+
+      // Include week 2 offsets
+      const tDate = new Date(dateThisWeek);
+      const nextWeekDateStr = new Date(tDate.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      rawOptions.push({
+        day_of_week: s.day_of_week,
+        date: nextWeekDateStr,
+        weekLabel: 'الأسبوع القادم',
+        schedule: s
+      });
+    });
+
+    // Group options by date
+    const groupedMap = new Map();
+    rawOptions.forEach(raw => {
+      const existing = groupedMap.get(raw.date);
+      if (existing) {
+        if (!existing.schedules.some(s => s.id === raw.schedule.id)) {
+          existing.schedules.push(raw.schedule);
+        }
+      } else {
+        groupedMap.set(raw.date, {
+          day_of_week: raw.day_of_week,
+          date: raw.date,
+          weekLabel: raw.weekLabel,
+          schedules: [raw.schedule]
+        });
+      }
+    });
+
+    const optList = Array.from(groupedMap.values()).sort((a,b) => new Date(a.date) - new Date(b.date));
+
+    let prompt = `عيادات الطبيب *د. ${selectedDoc.name}* متوفرة في الأيام التالية.\nيرجى كتابة رقم اليوم المقابل لإتمام الحجز:`;
+    optList.forEach((opt, idx) => {
+      const dayLabel = getDayNameArabic(opt.day_of_week);
+      prompt += `\n\n*${idx + 1}* - ${dayLabel} - ${opt.weekLabel} (${opt.date})`;
+    });
+
+    // Temporarily save options inside temporary columns or state
+    session.selected_doctor_id = selectedDoc.id;
+    // We can save state parameters directly to handle options dynamically
+    session.patient_name = JSON.stringify(optList); // Serialized Day Options list
+
+    return outputReply(prompt, 'SELECTING_DAY');
+  }
+
+  if (state === 'SELECTING_DAY') {
+    if (isTriggerMsg) {
+      session.current_state = 'IDLE';
+      return handleWhatsappFlow(cleanPhone, 'تسجيل');
+    }
+
+    let options = [];
+    try {
+      options = JSON.parse(session.patient_name || '[]');
+    } catch(e) {}
+
+    const daySelectIdx = parseInt(incomingMessage) - 1;
+    if (isNaN(daySelectIdx) || daySelectIdx < 0 || daySelectIdx >= options.length) {
+      return outputReply('❌ رقم الاختيار غير صحيح. يرجى اختيار رقم يوم صالح من القائمة.', 'SELECTING_DAY');
+    }
+
+    const chosenDayOpt = options[daySelectIdx];
+    const schedule = chosenDayOpt.schedules[0]; // first schedule
+
+    const startHour = parseInt(schedule.start_time.split(':')[0]);
+    const shiftLabel = startHour < 13 ? 'Morning' : 'Evening';
+
+    // Verify capacity
+    const { data: bookingsCount } = await supabase
+      .from('bookings')
+      .select('id')
+      .eq('doctor_id', session.selected_doctor_id)
+      .eq('booking_date', chosenDayOpt.date)
+      .eq('shift', shiftLabel)
+      .neq('status', 'cancelled');
+
+    const totalCount = bookingsCount ? bookingsCount.length : 0;
+    if (totalCount >= schedule.max_capacity) {
+      return outputReply(' عذراً، بلغت هذه الفترة السعة الاستيعابية القصوى المتاحة (ممتلئة). يرجى مراجعة طبيب آخر أو يوم عيادة مختلف.', 'IDLE');
+    }
+
+    session.selected_schedule_id = schedule.id;
+    session.selected_date = chosenDayOpt.date;
+    session.selected_shift = shiftLabel;
+    session.patient_name = null; // reset placeholder storage
+
+    return outputReply("يرجى كتابة اسم المريض الثلاثي أو الرباعي بوضوح لتأكيد وحفظ رقم الحجز الخاص بك:", 'AWAITING_NAME');
+  }
+
+  if (state === 'AWAITING_NAME') {
+    if (isTriggerMsg) {
+      session.current_state = 'IDLE';
+      return handleWhatsappFlow(cleanPhone, 'تسجيل');
+    }
+
+    const nameInput = incomingMessage.trim();
+    const wordsCount = nameInput.split(/\s+/).length;
+
+    if (wordsCount < 2) {
+      return outputReply("يرجى كتابة اسم المريض ثلاثياً على الأقل للتسجيل وتجنب الاسماء المتشابهة:", 'AWAITING_NAME');
+    }
+
+    // Verify duplicate booking name
+    const { data: duplicate } = await supabase
+      .from('bookings')
+      .select('id')
+      .eq('doctor_id', session.selected_doctor_id)
+      .eq('booking_date', session.selected_date)
+      .ilike('patient_name', nameInput)
+      .neq('status', 'cancelled')
+      .maybeSingle();
+
+    if (duplicate) {
+      return outputReply("⚠️ هذا الاسم مسجل مسبقاً لدى هذا الطبيب في نفس اليوم. يرجى إدخال اسم المريض ثلاثياً مع اللقب بوضوح:", 'AWAITING_NAME');
+    }
+
+    // Get next queue number for doctor/date/shift
+    const { data: qData } = await supabase
+      .from('bookings')
+      .select('queue_number')
+      .eq('doctor_id', session.selected_doctor_id)
+      .eq('booking_date', session.selected_date)
+      .eq('shift', session.selected_shift);
+
+    const maxQ = qData && qData.length > 0 ? Math.max(...qData.map(b => b.queue_number || 0)) : 0;
+    const nextQueueNumber = Math.max(maxQ, qData?.length || 0) + 1;
+
+    // Create entry in bookings
+    const { data: insertedBooking, error: insertErr } = await supabase
+      .from('bookings')
+      .insert([{
+        doctor_id: session.selected_doctor_id,
+        schedule_id: session.selected_schedule_id,
+        patient_name: nameInput,
+        patient_phone: '+' + cleanPhone,
+        booking_date: session.selected_date,
+        queue_number: nextQueueNumber,
+        shift: session.selected_shift,
+        status: 'pending',
+        payment_status: 'pending',
+        verified_by_whatsapp: true
+      }])
+      .select()
+      .single();
+
+    if (insertErr) {
+      console.error('Error saving booking:', insertErr);
+      return outputReply("عذراً، واجه النظام خطأً فنياً أثناء محاولة حفظ حجزك. يرجى المحاولة مرة أخرى لاحقاً.", 'IDLE');
+    }
+
+    const deadlineDate = new Date();
+    deadlineDate.setDate(deadlineDate.getDate() + 2);
+    const deadlineStr = deadlineDate.toISOString().split('T')[0];
+
+    const isMorning = session.selected_shift === 'Morning';
+    const shiftTextLabel = isMorning ? 'صباحية' : 'مسائية';
+    const circledQueue = getCircledNumber(nextQueueNumber);
+
+    const confirmationMessage = `✅ *تم تأكيد طلب الحجز بنجاح!*\n\n` +
+      `👤 *الاسم:* ${nameInput}\n` +
+      `🔢 *رقم دورك:* ${circledQueue}\n` +
+      `⏰ *الفترة:* ${shiftTextLabel}\n` +
+      `📅 *التاريخ:* ${session.selected_date}\n\n` +
+      `🚑 *ملاحظة هامة:* يرجى التوجه لقسم الحسابات وصرف الدفتر لتأكيد حجزك رسمياً خلال يومين من هذا التاريخ بحد أقصى (قبل ${deadlineStr} )، وإلا سيتم إلغاء طلب تسجيلك تلقائياً شكراً لتعاونكم.`;
+
+    // Clear session state
+    await supabase.from('bot_sessions').delete().eq('phone', cleanPhone);
+
+    return outputReply(confirmationMessage, 'IDLE');
+  }
+
+  return outputReply("مرحباً بك في مستشفى برج الأطباء.\nللبدء في تسجيل موعد جديد آلياً، يرجى إرسال كلمة *تسجيل*", 'IDLE');
 }
 
-async function saveSessionToDatabase(sessionData) {
-  console.log(`[Session Manager] Saving encrypted runtime credentials state directly in cloud Database...`);
-  const { error } = await supabase
-    .from('whatsapp_sessions')
-    .upsert({
-      render_server_id: RENDER_SERVER_ID,
-      session_data: sessionData,
-      updated_at: new Date().toISOString()
-    }, { onConflict: 'render_server_id' });
-
-  if (error) {
-    console.error('[Session Manager] Backup storage sequence failed:', error.message);
-  } else {
-    console.log('[Session Manager] Backup synced successfully. ✔️');
-  }
-}
-
-// -------------------------------------------------------------------------
-// بدء تشغيل البوت وتتبع الارتباط (Baileys Engine)
-// -------------------------------------------------------------------------
-async function startWhatsAppBot() {
-  console.log('[Baileys Config] Booting engine state...');
+// Start bot and launch Express
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[HTTP Server] Running and listening on port http://0.0.0.0:${PORT}`);
+  startWhatsAppBot();
+});  console.log('[Baileys Config] Booting engine state...');
   
   // نستخدم معايير حماية الذاكرة العشوائية لتخفيف الحجم المستهلك
   const { state, saveCreds } = await useMultiFileAuthState('./session_local');

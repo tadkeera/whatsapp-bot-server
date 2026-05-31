@@ -1,103 +1,158 @@
-require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-const { createClient } = require('@supabase/supabase-js');
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const AdmZip = require('adm-zip');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 7860;
-const SPACE_SERVER_ID = process.env.SPACE_SERVER_ID || 'default_space_server';
+const SPACE_SERVER_ID = process.env.SPACE_SERVER_ID || 'borg-hospital-primary';
 
-// Initialize Supabase Connection
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// تهيئة اتصال سوبابيز
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('[Error] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY are missing from environment!');
-  process.exit(1);
-}
+let qrCodeData = '';
+let isReady = false;
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false }
+// إعداد عميل الواتساب المتوافق تماماً مع بيئة لينكس وكروميوم داخل Docker
+const client = new Client({
+    authStrategy: new LocalAuth({ clientId: SPACE_SERVER_ID }),
+    puppeteer: {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--single-process',
+            '--disable-gpu'
+        ],
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium'
+    }
 });
 
-// App connection statuses
-let globalQrText = null;
-let connectionStatus = 'DISCONNECTED'; // DISCONNECTED, CONNECTING, AWAITING_SCAN, CONNECTED
-let lastBackupAt = null;
+// استقبال كود الـ QR
+client.on('qr', (qr) => {
+    qrCodeData = qr;
+    isReady = false;
+    console.log('QR Code updated. Ready to scan.');
+});
 
-// =========================================================================
-// ZIP BACKUP AND RESTORE UTILITIES (Bypasses ephemeral container restarts)
-// =========================================================================
-
-async function restoreAuthSession() {
-  try {
-    console.log('[Auth Persistence] Restoring latest backup from Supabase...');
-    const { data, error } = await supabase
-      .from('whatsapp_sessions')
-      .select('session_data')
-      .eq('space_server_id', SPACE_SERVER_ID)
-      .maybeSingle();
-
-    if (error) {
-      console.error('[Auth Restore Error]', error.message);
-      return;
+// نجاح الاتصال بالواتساب
+client.on('ready', async () => {
+    isReady = true;
+    qrCodeData = '';
+    console.log(`WhatsApp Client is Ready for Server ID: ${SPACE_SERVER_ID}`);
+    
+    try {
+        await supabase.from('whatsapp_settings').upsert({ 
+            server_id: SPACE_SERVER_ID, 
+            status: 'connected', 
+            updated_at: new Date() 
+        });
+    } catch (err) {
+        console.error('Supabase update failed:', err);
     }
+});
 
-    if (data && data.session_data) {
-      const authDir = path.join(__dirname, '.wwebjs_auth');
-      if (fs.existsSync(authDir)) {
-        fs.rmSync(authDir, { recursive: true, force: true });
-      }
+// معالجة الرسائل الواردة (البوت الذكي)
+client.on('message', async (msg) => {
+    const from = msg.from;
+    const body = msg.body;
 
-      const zipBuffer = Buffer.from(data.session_data, 'base64');
-      const zip = new AdmZip(zipBuffer);
-      zip.extractAllTo(authDir, true);
-      console.log('[Auth Persistence] Saved state recovered successfully from Supabase!');
-    } else {
-      console.log('[Auth Persistence] No saved state found. Starting fresh QR session...');
+    // تشغيل منطق الرد التلقائي فقط للمحادثات الفردية وليس المجموعات
+    if (!from.endsWith('@g.us')) {
+        try {
+            let { data: session } = await supabase
+                .from('bot_sessions')
+                .select('*')
+                .eq('patient_phone', from)
+                .maybeSingle();
+
+            let nextState = 'WELCOME';
+            if (session) {
+                nextState = session.current_state;
+            }
+
+            let replyMessage = '';
+            if (nextState === 'WELCOME') {
+                replyMessage = 'مرحباً بك في مستشفى بورج. لتأكيد موعدك اضغط (1)، لإلغاء الموعد اضغط (2).';
+                nextState = 'AWAITING_CONFIRMATION';
+            } else if (nextState === 'AWAITING_CONFIRMATION') {
+                if (body === '1') {
+                    replyMessage = 'تم تأكيد موعدك بنجاح. شكرًا لك!';
+                    nextState = 'COMPLETED';
+                } else if (body === '2') {
+                    replyMessage = 'تم إلغاء الموعد بنجاح.';
+                    nextState = 'CANCELLED';
+                } else {
+                    replyMessage = 'خيار غير صحيح. يرجى إرسال (1) للتأكيد أو (2) للإلغاء.';
+                }
+            } else {
+                replyMessage = 'مرحباً بك مجدداً. تم تسجيل طلبك السابق بنجاح.';
+            }
+
+            await supabase.from('bot_sessions').upsert({ 
+                patient_phone: from, 
+                current_state: nextState, 
+                updated_at: new Date() 
+            });
+            
+            await client.sendMessage(from, replyMessage);
+        } catch (error) {
+            console.error('Error in chatbot automation:', error);
+        }
     }
-  } catch (err) {
-    console.error('[Auth Restore General Exception]', err.message);
-  }
-}
+});
 
-async function backupAuthSession() {
-  try {
-    const authDir = path.join(__dirname, '.wwebjs_auth');
-    if (!fs.existsSync(authDir)) {
-       console.log('[Auth Persistence] No authentication files found locally to backup.');
-       return;
+// مسار عرض الـ QR من المتصفح
+app.get('/api/qr', (req, res) => {
+    if (isReady) {
+        return res.send('<h3>WhatsApp Client is already connected!</h3>');
     }
-
-    console.log('[Auth Persistence] Generating backup bundle zip...');
-    const zip = new AdmZip();
-    zip.addLocalFolder(authDir);
-    const zipBase64 = zip.toBuffer().toString('base64');
-
-    const { error } = await supabase
-      .from('whatsapp_sessions')
-      .upsert({
-        space_server_id: SPACE_SERVER_ID,
-        session_data: zipBase64,
-        updated_at: new Date().toISOString()
-      }, { onConflict: 'space_server_id' });
-
-    if (error) {
-      console.error('[Auth Backup Error] Failed to update Supabase row:', error.message);
-    } else {
-      lastBackupAt = new Date().toISOString();
-      console.log('[Auth Persistence] Session successfully backed up to Supabase database!');
+    if (!qrCodeData) {
+        return res.send('<h3>Generating QR code... Please refresh the page in 10 seconds.</h3>');
     }
-  } catch (err) {
-    console.error('[Auth Backup Exception]', err.message);
-  }
+    const qrImageSrc = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrCodeData)}`;
+    res.send(`
+        <div style="text-align: center; margin-top: 50px; font-family: Arial, sans-serif;">
+            <h2>Scan to Link Hospital Bot</h2>
+            <div style="margin: 20px 0;">
+                <img src="${qrImageSrc}" alt="QR Code" style="border: 2px solid #333; padding: 10px; border-radius: 8px;" />
+            </div>
+            <p>Server ID: <strong style="color: #007bff;">${SPACE_SERVER_ID}</strong></p>
+            <p style="color: #666; font-size: 14px;">Refresh page if code expires.</p>
+        </div>
+    `);
+});
+
+// مسار استقبال طلبات الإرسال من سيرفر Vercel
+app.post('/api/send-message', async (req, res) => {
+    const { to, message } = req.body;
+    if (!isReady) {
+        return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
+    }
+    try {
+        const formattedTo = to.includes('@c.us') ? to : `${to.replace('+', '')}@c.us`;
+        await client.sendMessage(formattedTo, message);
+        res.json({ success: true, message: 'Notification sent successfully' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// فحص الحالة العامة للسيرفر
+app.get('/', (req, res) => {
+    res.json({ status: "online", server_id: SPACE_SERVER_ID, whatsapp_connected: isReady });
+});
+
+client.initialize().catch(err => console.error('Initialization error:', err));
+
+app.listen(PORT, () => {
+    console.log(`Server running successfully on port ${PORT}`);
+});
 }
 
 // =========================================================================

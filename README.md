@@ -22,4 +22,4 @@ This repository is configured to deploy directly to **Hugging Face Spaces** as a
    - `SUPABASE_URL`: Your Supabase Project Web URL.
    - `SUPABASE_SERVICE_ROLE_KEY`: Service role secret key to handle chatbot database entries.
    - `SPACE_SERVER_ID`: Unique ID for this space deployment (e.g., `doctor_clinic_whatsapp_1`).
-5. Commit and push these files to the space repository.
+5. Commit and push these files to the space repository. 

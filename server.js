@@ -13,6 +13,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 
 let qrCodeData = '';
 let isReady = false;
+let outboundQueue = Promise.resolve(); // طابور لضمان جدولة رسائل التذكير بفارق زمني
 
 // إعداد عميل الواتساب المتوافق مع بيئة Docker
 const client = new Client({
@@ -40,7 +41,7 @@ client.on('qr', (qr) => {
     console.log('QR Code updated. Ready to scan.');
 });
 
-// نجاح الاتصال بالواتساب وتحديث الحالة في سوبابيز مع الـ provider الصحيح
+// نجاح الاتصال بالواتساب وتحديث الحالة في سوبابيز
 client.on('ready', async () => {
     isReady = true;
     qrCodeData = '';
@@ -50,7 +51,7 @@ client.on('ready', async () => {
         await supabase.from('whatsapp_settings').upsert({ 
             server_id: SPACE_SERVER_ID, 
             status: 'connected', 
-            provider: 'huggingface', // القيمة الجديدة المتوافقة مع الـ Constraint المحدثة
+            provider: 'huggingface',
             updated_at: new Date() 
         });
     } catch (err) {
@@ -77,30 +78,50 @@ client.on('message', async (msg) => {
             }
 
             let replyMessage = '';
+            let sendSaveContactNotice = false; // مؤشر لإرسال رسالة حفظ الرقم
+
             if (nextState === 'WELCOME') {
                 replyMessage = 'مرحباً بك في مستشفى بورج. لتأكيد موعدك اضغط (1)، لإلغاء الموعد اضغط (2).';
                 nextState = 'AWAITING_CONFIRMATION';
             } else if (nextState === 'AWAITING_CONFIRMATION') {
                 if (body === '1') {
-                    replyMessage = 'تم تأكيد موعدك بنجاح. شكرًا لك!';
+                    replyMessage = 'تم تأكيد موعدكم بنجاح. تسعدنا خدمتكم دائماً، متمنين لكم دوام الصحة والعافية.';
                     nextState = 'COMPLETED';
+                    sendSaveContactNotice = true; // تفعيل إرسال الرسالة الاحترافية المنفصلة
                 } else if (body === '2') {
-                    replyMessage = 'تم إلغاء الموعد بنجاح.';
+                    replyMessage = 'تم إلغاء الموعد بنجاح بناءً على طلبكم. يسعدنا خدمتكم وتلقي حجوزاتكم في أي وقت آخر.';
                     nextState = 'CANCELLED';
                 } else {
-                    replyMessage = 'خيار غير صحيح. يرجى إرسال (1) للتأكيد أو (2) للإلغاء.';
+                    replyMessage = 'عذراً، الخيار المدخل غير صحيح. يرجى إرسال الرقم (1) لتأكيد الموعد، أو الرقم (2) لإلغائه.';
                 }
             } else {
-                replyMessage = 'مرحباً بك مجدداً. تم تسجيل طلبك السابق بنجاح.';
+                replyMessage = 'مرحباً بك مجدداً في مستشفى بورج. تم تسجيل وتأكيد طلبك السابق مسبقاً.';
             }
 
+            // تحديث قاعدة البيانات
             await supabase.from('bot_sessions').upsert({ 
                 patient_phone: from, 
                 current_state: nextState, 
                 updated_at: new Date() 
             });
             
+            // إرسال رسالة الرد الأساسية
             await client.sendMessage(from, replyMessage);
+
+            // إذا تم تأكيد الحجز، يتم إرسال رسالة التوجيه الاحترافية بشكل منفصل بعد ثانية واحدة
+            if (sendSaveContactNotice) {
+                setTimeout(async () => {
+                    const professionalNotice = 
+                        "💡 *عزيزنا المريض:*\n\n" +
+                        "لضمان استمرار تلقي إشعارات المواعيد والتحديثات الطبية الهامة الخاصة بكم وبأعلى جودة، " +
+                        "يرجى التكرم بـ *حفظ رقم هاتف المستشفى هذا ضمن جهات الاتصال الخاصة بكم*.\n\n" +
+                        "شاكرين لكم حسن تعاونكم وتفهمكم.\n" +
+                        "*إدارة مستشفى بورج*";
+                    
+                    await client.sendMessage(from, professionalNotice).catch(e => console.error('Error sending notice:', e));
+                }, 1500); // فاصل زمني بسيط ثانية ونصف لتبدو طبيعية جداً
+            }
+
         } catch (error) {
             console.error('Error in chatbot automation:', error);
         }
@@ -128,19 +149,32 @@ app.get('/api/qr', (req, res) => {
     `);
 });
 
-// مسار استقبال طلبات الإرسال من سيرفر Vercel لإرسال التنبيهات والمواعيد تلقائياً
+// مسار استقبال طلبات الإرسال من سيرفر Vercel (مع تطبيق فاصل زمني دقيقة كاملة بين الرسائل المجدولة)
 app.post('/api/send-message', async (req, res) => {
     const { to, message } = req.body;
     if (!isReady) {
         return res.status(503).json({ success: false, error: 'WhatsApp client is not ready' });
     }
-    try {
-        const formattedTo = to.includes('@c.us') ? to : `${to.replace('+', '')}@c.us`;
-        await client.sendMessage(formattedTo, message);
-        res.json({ success: true, message: 'Notification sent successfully' });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+
+    const formattedTo = to.includes('@c.us') ? to : `${to.replace('+', '')}@c.us`;
+
+    // إضافة الرسالة إلى طابور الانتظار لضمان تنفيذ فاصل دقيقة كاملة (60,000ms) بين كل تنبيه تذكيري وآخر
+    outboundQueue = outboundQueue.then(() => {
+        return new Promise((resolve) => {
+            setTimeout(async () => {
+                try {
+                    await client.sendMessage(formattedTo, message);
+                    console.log(`Notification sent successfully to ${formattedTo}`);
+                } catch (error) {
+                    console.error(`Failed to send notification to ${formattedTo}:`, error.message);
+                }
+                resolve(); // الانتقال للرسالة التالية في الطابور بعد انتهاء الدقيقة
+            }, 60000); // 60 ألف مللي ثانية = دقيقة كاملة
+        });
+    });
+
+    // الرد الفوري على سيرفر Vercel بأنه تم استلام الرسالة وجدولتها في طابور الأمان بنجاح
+    res.json({ success: true, message: 'Message has been securely queued with a 1-minute delay' });
 });
 
 // فحص الحالة العامة للسيرفر
@@ -155,4 +189,3 @@ client.initialize().catch(err => console.error('Initialization error:', err));
 app.listen(PORT, () => {
     console.log(`Server running successfully on port ${PORT}`);
 });
-
